@@ -22,10 +22,10 @@ const getAuthToken = async () => {
                 grant_type: 'client_credentials',
                 scope: 'bucket:read bucket:create data:read data:write'
             }), {
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                }
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded'
             }
+        }
         );
         console.log("hit 2");
         return response.data.access_token;
@@ -35,42 +35,85 @@ const getAuthToken = async () => {
     }
 };
 
-const uploadFile = async (authToken, fileBuffer, fileName) => {
-    const response = await axios({
-        method: 'PUT',
-        url: 'https://developer.api.autodesk.com/oss/v2/buckets/your_bucket_name/objects/' + fileName,
-        headers: {
-            'Authorization': `Bearer ${authToken}`,
-            'Content-Type': 'application/octet-stream'
-        },
-        data: fileBuffer
-    });
+const createBucket = async (authToken, bucketKey) => {
+    try {
+        const response = await axios({
+            method: 'POST',
+            url: 'https://developer.api.autodesk.com/oss/v2/buckets',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
+            },
+            data: {
+                bucketKey: bucketKey,
+                policyKey: 'transient' // Or 'temporary', 'persistent' based on your requirement
+            }
+        });
+        console.log("bucket key created")
+        return response.data;
+    } catch (error) {
+        console.error("Error creating bucket:", error.response ? error.response.data : error);
+        throw error;
+    }
+};
 
-    return response.data;
+const uploadFile = async (authToken, fileBuffer, fileName, bucketKey) => {
+    try {
+        const response = await axios({
+            method: 'PUT',
+            url: `https://developer.api.autodesk.com/oss/v2/buckets/${bucketKey}/objects/${fileName}`,
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/octet-stream'
+            },
+            data: fileBuffer
+        });
+        console.log("file uploaded")
+        return response.data;
+    } catch (error) {
+        console.error("Error uploading file:", error.response ? error.response.data : error);
+
+    }
 };
 
 const translateFile = async (authToken, urn) => {
-    const response = await axios({
-        method: 'POST',
-        url: 'https://developer.api.autodesk.com/modelderivative/v2/designdata/job',
-        headers: {
-            'Authorization': `Bearer ${authToken}`,
-            'Content-Type': 'application/json'
-        },
-        data: {
-            input: {
-                urn
+    try {
+        const response = await axios({
+            method: 'POST',
+            url: 'https://developer.api.autodesk.com/modelderivative/v2/designdata/job',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/json'
             },
-            output: {
-                formats: [{
-                    type: 'svf',
-                    views: ['2d', '3d']
-                }]
+            data: {
+                input: {
+                    urn
+                },
+                output: {
+                    formats: [{
+                        type: 'svf',
+                        views: ['2d', '3d']
+                    }]
+                }
             }
+        });
+        return response.data;
+    } catch (error) {
+        console.error("Error creating bucket:", error.response ? error.response.data : error);
+        throw error;
+    }
+};
+
+const checkTranslationStatus = async (authToken, urn) => {
+    const response = await axios({
+        method: 'GET',
+        url: `https://developer.api.autodesk.com/modelderivative/v2/designdata/${urn}/manifest`,
+        headers: {
+            'Authorization': `Bearer ${authToken}`
         }
     });
 
-    return response.data;
+    return response.data.status;
 };
 
 const getModelProperties = async (authToken, urn) => {
@@ -103,22 +146,45 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         const fileBuffer = fs.readFileSync(req.file.path);
         const fileName = req.file.originalname;
 
-        const uploadResponse = await uploadFile(authToken, fileBuffer, fileName);
+        const bucketKey = 'nezuko1949';
+        // await createBucket(authToken, bucketKey);
+
+        const uploadResponse = await uploadFile(authToken, fileBuffer, fileName, bucketKey);
         const urn = Buffer.from(uploadResponse.objectId).toString('base64');
 
         const translateResponse = await translateFile(authToken, urn);
 
-        if (translateResponse.result === 'success') {
+        console.log(translateResponse)
+        if (translateResponse.result === 'created') {
+            console.log("hit 1")
+            let translationStatus = await checkTranslationStatus(authToken, urn);
+            console.log(translationStatus)
+
+            while (translationStatus !== 'success') {
+                console.log('Checking translation status...');
+                await new Promise(resolve => setTimeout(resolve, 5000)); // wait for 5 seconds before checking again
+                translationStatus = await checkTranslationStatus(authToken, urn);
+            }
+
             const modelProperties = await getModelProperties(authToken, urn);
+            console.log(modelProperties)
             const guid = modelProperties.data.metadata[0].guid;
-
+            console.log(guid)
             const layerProperties = await getLayerProperties(authToken, urn, guid);
+            console.log(layerProperties, "layerproperties")
 
-            const parkingLayer = layerProperties.data.collection.find(item => item.name === 'Parking');
+            console.log(layerProperties.data.collection);
+
+            const parkingLayer = layerProperties.data.collection.find(item => {
+                return item.name.toLowerCase().includes('parking');
+            });
+            
+            console.log(parkingLayer)
             if (parkingLayer) {
                 const area = parkingLayer.properties.Area;
                 res.json({ area });
             } else {
+                console.log("not found")
                 res.status(404).json({ error: 'Parking layer not found' });
             }
         } else {
