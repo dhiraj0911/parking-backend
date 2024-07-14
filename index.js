@@ -72,7 +72,6 @@ const uploadFile = async (authToken, fileBuffer, fileName, bucketKey) => {
         return response.data;
     } catch (error) {
         console.error("Error uploading file:", error.response ? error.response.data : error);
-
     }
 };
 
@@ -99,45 +98,42 @@ const translateFile = async (authToken, urn) => {
         });
         return response.data;
     } catch (error) {
-        console.error("Error creating bucket:", error.response ? error.response.data : error);
+        console.error("Error translating file:", error.response ? error.response.data : error);
         throw error;
     }
 };
 
 const checkTranslationStatus = async (authToken, urn) => {
-    const response = await axios({
-        method: 'GET',
-        url: `https://developer.api.autodesk.com/modelderivative/v2/designdata/${urn}/manifest`,
-        headers: {
-            'Authorization': `Bearer ${authToken}`
-        }
-    });
+    try {
+        const response = await axios({
+            method: 'GET',
+            url: `https://developer.api.autodesk.com/modelderivative/v2/designdata/${urn}/manifest`,
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
 
-    return response.data.status;
+        return response.data.status;
+    } catch (error) {
+        console.error("Error checking translation status:", error.response ? error.response.data : error);
+        throw error;
+    }
 };
 
-const getModelProperties = async (authToken, urn) => {
-    const response = await axios({
-        method: 'GET',
-        url: `https://developer.api.autodesk.com/modelderivative/v2/designdata/${urn}/metadata`,
-        headers: {
-            'Authorization': `Bearer ${authToken}`
-        }
-    });
-
-    return response.data;
-};
-
-const getLayerProperties = async (authToken, urn, guid) => {
-    const response = await axios({
-        method: 'GET',
-        url: `https://developer.api.autodesk.com/modelderivative/v2/designdata/${urn}/metadata/${guid}/properties`,
-        headers: {
-            'Authorization': `Bearer ${authToken}`
-        }
-    });
-
-    return response.data;
+const getProperties = async (authToken, urn, guid) => {
+    try {
+        const response = await axios({
+            method: 'GET',
+            url: `https://developer.api.autodesk.com/modelderivative/v2/designdata/${urn}/metadata/${guid}/properties`,
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+        return response.data.data.collection;
+    } catch (error) {
+        console.error("Error fetching properties:", error.response ? error.response.data : error);
+        throw error;
+    }
 };
 
 app.post('/upload', upload.single('file'), async (req, res) => {
@@ -152,44 +148,65 @@ app.post('/upload', upload.single('file'), async (req, res) => {
         const uploadResponse = await uploadFile(authToken, fileBuffer, fileName, bucketKey);
         const urn = Buffer.from(uploadResponse.objectId).toString('base64');
 
-        const translateResponse = await translateFile(authToken, urn);
+        await translateFile(authToken, urn);
 
-        console.log(translateResponse)
-        if (translateResponse.result === 'created') {
-            console.log("hit 1")
-            let translationStatus = await checkTranslationStatus(authToken, urn);
-            console.log(translationStatus)
-
-            while (translationStatus !== 'success') {
-                console.log('Checking translation status...');
-                await new Promise(resolve => setTimeout(resolve, 5000)); // wait for 5 seconds before checking again
-                translationStatus = await checkTranslationStatus(authToken, urn);
+        // Wait for translation to complete
+        let translationStatus = 'inprogress';
+        while (translationStatus === 'inprogress') {
+            translationStatus = await checkTranslationStatus(authToken, urn);
+            if (translationStatus === 'failed') {
+                throw new Error('Translation failed');
             }
-
-            const modelProperties = await getModelProperties(authToken, urn);
-            console.log(modelProperties)
-            const guid = modelProperties.data.metadata[0].guid;
-            console.log(guid)
-            const layerProperties = await getLayerProperties(authToken, urn, guid);
-            console.log(layerProperties, "layerproperties")
-
-            console.log(layerProperties.data.collection);
-
-            const parkingLayer = layerProperties.data.collection.find(item => {
-                return item.name.toLowerCase().includes('parking');
-            });
-            
-            console.log(parkingLayer)
-            if (parkingLayer) {
-                const area = parkingLayer.properties.Area;
-                res.json({ area });
-            } else {
-                console.log("not found")
-                res.status(404).json({ error: 'Parking layer not found' });
+            if (translationStatus === 'success') {
+                break;
             }
-        } else {
-            res.status(500).json({ error: 'Translation failed' });
+            await new Promise(resolve => setTimeout(resolve, 5000)); // Wait for 5 seconds before checking again
         }
+
+        // Get the metadata GUID
+        const metadataResponse = await axios({
+            method: 'GET',
+            url: `https://developer.api.autodesk.com/modelderivative/v2/designdata/${urn}/metadata`,
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+        const guid = metadataResponse.data.data.metadata[0].guid;
+
+        // Get properties
+        const properties = await getProperties(authToken, urn, guid);
+
+        // Extract total area for each layer
+        const layerAreas = {};
+        properties.forEach((item) => {
+            if (item.properties && item.properties['General'] && item.properties['General']['Layer']) {
+                // console.log(item.properties.General.Handle)
+                const handle = item.properties['General']['Handle'];
+                const area = parseFloat(item.properties['Geometry']?.Area || 0);
+                layerAreas[handle] = { area, layer: item.properties['General']['Layer'] };
+            }
+        });
+        console.log(layerAreas)
+
+        // Calculate total area for open and close parking
+        const closeParkingLayer = '23a';
+        const plotBoundaryLayer = '267';
+
+        // Open parking area calculation
+        const openParkingArea = layerAreas[plotBoundaryLayer].area - layerAreas[closeParkingLayer].area;
+
+        // Close parking area calculation
+        let unusedSpace = 0;
+        for (const handle in layerAreas) {
+            if (layerAreas[handle].layer === 'Parking layer' && handle !== closeParkingLayer) {
+                unusedSpace += layerAreas[handle].area;
+            }
+        }
+        const closeParkingArea = layerAreas[closeParkingLayer].area - unusedSpace;
+
+        console.log({ closeParkingArea, openParkingArea });
+
+        res.json({ layerAreas });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
